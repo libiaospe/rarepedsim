@@ -1,0 +1,897 @@
+#!/usr/bin/env python
+# $File: srv_batch_simrareped.py $
+# $LastChangedDate: $
+# $Rev: $
+# This file is part of the RarePedSim program
+# Copyright (c) 2013-2015, Biao Li <libiaospe@gmail.com, biaol@bcm.edu>
+# GNU General Public License (http://www.gnu.org/licenses/gpl.html)
+#
+# Author: Biao Li
+# Purpose: RarePedSim interface and main functions
+#
+
+import argparse, sys, os, re, random, tempfile, time, shutil, itertools, pickle
+from src_simrareped.simRarePed import SimPed_random, SimPed_backward, SimPed_forward
+from src_simrareped import srv_batch_simrareped as srv
+from src_simrareped.utilityFunc import parseConfigFile, readFiles, calRandSampleSizes, SaveFiles, CreatePedStructure, compressSave, genotyping_artifact, calIndProbAffDict, selectCausalVarSite, calHapNumVarFreq, writeVCF
+from src_simrareped.simulator import mixedPop
+from src_simrareped.utilityFunc import initPowerdataObj
+from joblib import Parallel, delayed
+import progressbar
+import logging
+import src_simrareped.colorer
+logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.DEBUG)
+from distutils.util import strtobool
+import src_simrareped.parallel as parallel
+
+def user_yes_no_query(question):
+    sys.stdout.write('%s [y/n]\n' % question)
+    while True:
+        try:
+            return strtobool(raw_input().lower())
+        except ValueError:
+            sys.stdout.write('please respond with \'y\' or \'n\'.\n')    
+
+
+def srvArguments(parser):
+    parser.add_argument('-c', '--config_file',
+                        type=str,
+                        metavar='FILE',
+                        required=True,
+                        help='''Load configuration file (*.conf) which contains arguments and parameter values to generate site allele frequency spectrum (sfs) by forward-time evolutionary simulation''')
+    parser.add_argument('--debug',
+                        default=False,
+                        action='store_true',
+                        help=argparse.SUPPRESS)
+
+    
+def generateArguments(parser):
+    parser.add_argument('-s', '--sfs_file',
+                        type=str,
+                        required=True,
+                        metavar='FILE',
+                        help='''Load site frequency spectrum file (*.sfs) file''')
+    parser.add_argument('-c', '--config_file',
+                        type=str,
+                        metavar='FILE',
+                        required=True,
+                        help='''Load configuration file (*.conf) that includes arguments and parameter values of phenotype model''')
+    parser.add_argument('-p', '--ped_file',
+                        type=str,
+                        required=True,
+                        metavar='FILE',
+                        help='''Load linkage format file (*.ped) with user-specified pedigree structure(s)''')
+    parser.add_argument('-o', '--output_folder',
+                        type=str,
+                        metavar='FILE',
+                        default='output',
+                        help='''Specify output folder name (prefix), /path/to/output_folder/ (default to ./output). Simulation results will be saved in LINKAGE (ped) format''')
+    parser.add_argument('-r', '--num_reps',
+                        type=int,
+                        metavar='INT',
+                        default=1,
+                        help='''Specify number of replicated data sets to generate per gene (default to 1)''')
+    parser.add_argument('-g', '--num_genes',
+                        type=int,
+                        metavar='INT',
+                        default=1,
+                        help='''Specify number of genes to generate (default to 1), if -1 use all available genes in arg.sfs_file''')
+    parser.add_argument('-e', '--rec_rate',
+                        type=float,
+                        metavar='FLOAT',
+                        default=0,
+                        help='''Recombination rate on the gene region, default to 0 and max at 0.5''')
+    parser.add_argument('-j', '--num_jobs',
+                        type=int,
+                        metavar='INT',
+                        default=-1,
+                        help='''Specify the number of jobs (CPUs) to use for multiprocessing computation (default to -1). For -1 all CPUs are used; for 1 no parallel; for --num_jobs below -1, CPU#s+1+num_jobs are used, e.g. for -2 all CPUs but one are used.''')
+    parser.add_argument('-d', '--seed',
+                        type=float,
+                        default=None,
+                        metavar='NUM',
+                        help='''Specify seed for random number generator, if left unspecified the current system time will be used''')
+    parser.add_argument('-b', '--verbose',
+                        type=int,
+                        default=1,
+                        choices=[-1,0,1],
+                        help='''Specify screen output mode (-1, 0 or 1, default to 1); where -1 -- quiet, no screen output; 0 -- minimum, minimum output of program running progress; 1 -- regular, regular output of simulation progress and time spent''')
+    parser.add_argument('-m', '--compress',
+                        type=str,
+                        default=None,
+                        choices=['bz2', 'gz', 'zip'],
+                        help='''Choose file format to compress simulated data, default to None - no compression''')
+    parser.add_argument('-f', '--vcf',
+                        default=False,
+                        action='store_true',
+                        help='''Also output simulated data in VCF(*.vcf) format in addition to LINKAGE(*.ped) format.''')
+    # args.scalar - use 1/scalar * 100% as cutoff to remove genotype configurations of which the cumulative probabilities < cutoff
+    parser.add_argument('-i', '--fill_missing_pheno',
+                        default=False,
+                        action='store_true',
+                        help='''Fill in missing phenotypes''')
+    parser.add_argument('--scalar',
+                        type=int,
+                        default=5,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--lineage',
+                        default=False,
+                        action='store_true',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--debug',
+                        default=False,
+                        action='store_true',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--tempdir',
+                        type=str,
+                        default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('-a', '--map_file',
+                        default=None,
+                        type=file,
+                        help=argparse.SUPPRESS)
+
+def srv_func(args):
+    '''
+     Generate srv_batch pool using forward-time evolutionary simulation framework
+    (adapted from srv, Peng and Liu, 2010)
+    Please refer to "rarepedsim -h", "rarepedsiim srv simulate -h" and "rarepedsim srv mix -h"
+    '''
+  
+    pars = parseConfigFile(args.config_file)
+    # FIXME! Check user parameters in *.conf
+    srv.srvOutput(**pars)
+    return
+
+
+def generate_func(args):
+    '''
+    Please refer to simrareped -h
+    '''
+    # read *.sfs and *.conf files
+    try:
+        assert args.sfs_file is not None and args.config_file is not None
+    except:
+        raise ValueError("Both *.sfs file and *.conf file need to be specified\n")
+    if not args.seed:
+        args.seed = time.time()
+    random.seed(args.seed)
+    # validate output file name
+    path = args.output_folder
+    path = os.path.abspath(os.path.expanduser(args.output_folder))
+    args.output_folder = path
+    if path != '':
+        try:
+            cwd = os.getcwd()
+            os.chdir(path)
+            os.chdir(cwd)
+        except:
+            try:
+                logging.warning('No such directory: {}'.format(path))
+                # create output folder recursively if it does not exist
+                os.makedirs(path)
+                logging.warning('Create directory {}'.format(path))
+            except Exception:
+                raise IOError("Cannot create directory: %s, check argument --output_folder\n" % path)
+    # read *.sfs file
+    sfsInfo = readFiles().sfs(args.sfs_file, args.verbose, args.num_genes)
+    args.num_genes = len(sfsInfo.keys())
+    # read *.conf file
+    configInfo = readFiles().config(args.config_file)
+    # specify trait_type according to configInfo
+    args.trait_type = configInfo['trait_type']
+    if args.trait_type.lower() not in ['complex', 'mendelian', 'c', 'm']:
+        raise ValueError("Wrong trait_type '%s' in --config_file. Can only specify trait_type between Complex/complex/C/c and Mendelian/mendelian/M/m" % args.trait_type)
+    # read *.ped file
+    pedInfo = readFiles().ped(args.ped_file)
+    # check rec_rate
+    if not (0 <= args.rec_rate <= 0.5):
+        raise ValueError("Recombination rate should be in the range of [0, 0.5]\n")
+    # check if output folder is empty
+    if len(os.listdir(path)) > 0:
+        if args.tempdir is None:
+            # dir contains contents
+            logging.warning("The output folder %s does not seem to be empty.\n" % args.output_folder)
+            action_if_proceed = True if args.debug else user_yes_no_query("Proceed anyways to allow RarePedSim to modify its contents if necessary?") 
+            if action_if_proceed == False:
+                sys.exit(0)
+        else:
+            try:
+                logging.warning('No such directory: {}'.format(args.tempdir))
+                # create output folder recursively if it does not exist
+                os.makedirs(args.tempdir)
+                logging.warning('Create directory {}'.format(args.tempdir))
+            except Exception:
+                raise IOError("Cannot create directory: %s, check argument --output_folder\n" % args.tempdir)
+    # save current working dir and change dir to tempFolder
+    cwd = os.getcwd()
+    geneNames = sfsInfo.keys()
+    ## For Mendelian trait simulation
+    if args.trait_type.lower() in ['m', 'mendelian']:
+        if args.verbose >= 0:
+            logging.info("Begin Mendelian trait simulation for pedigrees")
+        # Retrieve info about causal var sites, causal var mafs for each gene (raise Error if on any gene remaining number of causal var sites < 1; for Mendelian trait at least 1 causal var site)
+        moi = configInfo['moi']
+        if args.verbose >= 0:
+            logging.info("Retrieving causal variant sites information from {}".format(os.path.basename(args.sfs_file)))
+        causalVarSites = [selectCausalVarSite(sfsInfo[geneName]['maf'], sfsInfo[geneName]['annotation'], configInfo['def_rare'], configInfo['rare_only'], configInfo['proportion_causal'], geneName=geneName, minNum=1)[0] for geneName in geneNames]
+        causalVarMafs = [[sfsInfo[geneName]['maf'][idx] for idx in site] for geneName, site in zip(geneNames, causalVarSites)]
+        # Calculate haplotype frequency (number of variant counts on haplotype level)
+        if args.verbose >= 0:
+            logging.info("Calculating gene-level causal haplotype frequency")
+        hapVarFreqs = [calHapNumVarFreq(maf, max_vars=1) for maf in causalVarMafs]
+        # create individual-based probability of affection status given all possible genotypes
+        # for single mode (no locus heterogeneity)
+        # FIXME! Here it can parallel
+        if configInfo['mode'] == 'single':
+            for geneIdx, geneName in enumerate(geneNames):
+                # create temp folder to save intermediate ped files
+                if args.tempdir is not None:
+                    tempFolder = args.tempdir
+                else:
+                    tempFolder = tempfile.mkdtemp()
+                os.chdir(tempFolder)
+                # Restore genotype origins of all families contained in the ped file conditional on gene info of 'geneName'
+                # obtain pedigree-wise genotype frequency probability map (famInfoList, nucInfoList and CIProbMapList)
+                if args.verbose >= 0:
+                    logging.info("Begin analyzing pedigree-wise genotype frequencies for gene {}".format(geneName))
+                if not args.debug: # use parallel if not --debug
+                    r = Parallel(n_jobs=args.num_jobs, verbose=5 if args.verbose == 1 else 0, backend="multiprocessing")(delayed(parallel.parallel_restoreGenotypeOrigins_Mendelian)(familyID, familyDict, args.num_reps, args.scalar, hapVarFreqs[geneIdx], configInfo['penetrance']) for (familyID, familyDict) in zip(pedInfo.keys(), pedInfo.values()))
+                    famInfoList, nucInfoList, CIProbMapList = zip(*r)
+                else:  # use single thread if --debug
+                    famInfoList, nucInfoList, CIProbMapList = [], [], []
+                    if args.verbose >= 0:
+                        pbar = progressbar.ProgressBar(widgets=['', ' ', progressbar.Percentage(), ' ', progressbar.Bar('.'), ' ', progressbar.ETA(), ' '], maxval=len(pedInfo.keys())).start()
+                    for famIdx, (familyID, familyDict) in enumerate(zip(pedInfo.keys(), pedInfo.values())):
+                        
+                        ins = SimPed_backward(familyID, familyDict, args.num_reps, args.scalar, hapVarFreqs[geneIdx], configInfo['penetrance'], traitType='Mendelian')
+                        famInfoList.append(ins.famInfo)
+                        nucInfoList.append(ins.nucInfo)
+                        CIProbMapList.append(ins.CIProbMap)
+                        if args.verbose >= 0:
+                            pbar.update(famIdx)
+                    if args.verbose >= 0:
+                        pbar.finish()
+                # make gene name dir if does not exist
+                dirName = os.path.join(tempFolder, geneName)
+                try:
+                    os.mkdir(dirName)
+                except:
+                    pass
+                os.chdir(dirName)
+                # Begin simulation for each replicate
+                if args.verbose >= 0:
+                    logging.info("Simulation in progress for gene {}".format(geneName))
+                ## FIXME! temporarily disable parallel computing for generating genotypes because parallelization seems to be even slower than single core
+                if False:  # use parallel if not --debug
+                    Parallel(n_jobs=args.num_jobs, verbose=5 if args.verbose == 1 else 0, backend="multiprocessing")(delayed(parallel.parallel_generateGenotype_Mendelian_single)(rep, geneIdx, geneName, pedInfo, famInfoList, nucInfoList, CIProbMapList, sfsInfo, causalVarSites, causalVarMafs, configInfo, args.rec_rate, hapCoding='1-2') for rep in xrange(1, args.num_reps+1))
+                else:  # if --debug
+                    if args.verbose >= 0:
+                        pbar = progressbar.ProgressBar(widgets=['', ' ', progressbar.Percentage(), ' ', progressbar.Bar('.'), ' ', progressbar.ETA(), ' '], maxval=args.num_reps).start()
+                    for rep in xrange(1, args.num_reps+1):
+                        fileName = 'rep{}.ped'.format(rep)
+                        fi = open(fileName, 'w')
+                        # determine missing sites and probability of missing calls and probability of error calls
+                        _missingSites, _probMissingCalls, _probErrorCalls, _causality = determineMissingness(configInfo, sfsInfo, geneName)
+                        # for each family generate genotypes
+                        for famIdx, familyID in enumerate(pedInfo.keys()):
+                            # sample genotype origins for all individuals contained in the 'famIdx'th family
+                            indGenoOrigins = SimPed_backward.restoreGenotypeOrigin(nucInfoList[famIdx], CIProbMapList[famIdx])
+                            #
+                            #print CIProbMapList[famIdx]
+                            #print indGenoOrigins
+                            #print causalVarSites
+                            #
+                            # restore actual genotypes
+                            genoDict = SimPed_backward.generateGenotype(nucInfoList[famIdx], indGenoOrigins, sfsInfo[geneName], causalVarSites[geneIdx], causalVarMafs[geneIdx], configInfo['moi'], args.rec_rate, configInfo['compound_hetero'], args.map_file)
+                            #print genoDict
+                            #sys.exit()
+                            #
+                            # write simulated replicate to file
+                            SimPed_backward.writeToFile(familyID, famInfoList[famIdx], genoDict, fi, _missingSites, _probMissingCalls, _probErrorCalls, _causality, hapCoding='1-2', configInfo=configInfo, ifFillMissingPheno=args.fill_missing_pheno, causalSitesIdx=causalVarSites[geneIdx])
+                        if args.verbose >= 0:
+                            pbar.update(rep)
+                        fi.close()
+                        # also output simulated data in vcf format if needed
+                        if args.vcf:
+                            vcfFileName = 'rep{}.vcf'.format(rep)
+                            writeVCF(vcfFileName, pedFileName=fileName, chrInfo=sfsInfo[geneName]['chr'], posInfo=sfsInfo[geneName]['position'], refInfo=sfsInfo[geneName]['ref'], altInfo=sfsInfo[geneName]['alt'], varMafs=sfsInfo[geneName]['maf'])
+                    if args.verbose >= 0:
+                        pbar.finish()
+                
+                # upon completion of 'gene' compress simulated data if no tempdir is specified, otherwise do nothing
+                if args.tempdir is None:
+                    packaging(args, geneName, tempFolder)
+        ## for pairwise mode (with locus heterogeneity)
+        elif configInfo['mode'] == 'pairwise':
+            # create gene-specific genotype origins tempfolder
+            genoOriginTempFolder = tempfile.mkdtemp()
+            # FIXME! Here it can parallel
+            for geneIdx1, geneIdx2 in itertools.permutations(range(len(geneNames)), 2):
+                geneName1, geneName2 = geneNames[geneIdx1], geneNames[geneIdx2]
+                # create temp folder to save intermediate ped files
+                if args.tempdir is not None:
+                    tempFolder = args.tempdir
+                else:
+                    tempFolder = tempfile.mkdtemp()
+                # restore genotype origins of all families contained in the ped file conditional on gene info of both 'geneName1' and 'geneName2' genes - obtain pedigree-wise genotype frequency probability map (famInfoList, nucInfoList and CIProbMapList)
+                if args.verbose >= 0:
+                    logging.info("Begin analyzing pedigree-wise genotype frequencies for genes {} and {}".format(geneName1, geneName2))
+                os.chdir(genoOriginTempFolder)
+                # Note! Here famInfoList, nucInfoList, CIProbMapList are different from above when mode == 'single'
+                famInfoList, nucInfoList, CIProbMapList, = {1:[], 2:[]}, {1:[], 2:[]}, {1:[], 2:[]}
+                # gene1 & gene2
+                for geneIdx, name, order in zip((geneIdx1, geneIdx2), (geneName1, geneName2), (1,2)):
+                    # read previously saved file if it exists
+                    if os.path.isfile('{}.fnc'.format(name)):
+                        famInfoList[order], nucInfoList[order], CIProbMapList[order] = pickle.load(open('{}.fnc'.format(name), 'r'))
+                    else: # otherwise compute and save to file
+                        if not args.debug:  # use parallel if not --debug
+                            r = Parallel(n_jobs=args.num_jobs, verbose=5 if args.verbose == 1 else 0, backend="multiprocessing")(delayed(parallel.parallel_restoreGenotypeOrigins_Mendelian)(familyID, familyDict, args.num_reps, args.scalar, hapVarFreqs[geneIdx], configInfo['penetrance']) for (familyID, familyDict) in zip(pedInfo.keys(), pedInfo.values()))
+                            famInfoList[order], nucInfoList[order], CIProbMapList[order] = zip(*r)
+                        else: # use single thread if --debug
+                            if args.verbose >= 0:
+                                pbar = progressbar.ProgressBar(widgets=['', ' ', progressbar.Percentage(), ' ', progressbar.Bar('.'), ' ', progressbar.ETA(), ' '], maxval=len(pedInfo.keys())).start()
+                            for famIdx, (familyID, familyDict) in enumerate(zip(pedInfo.keys(), pedInfo.values())):
+                                ins = SimPed_backward(familyID, familyDict, args.num_reps, args.scalar, hapVarFreqs[geneIdx], configInfo['penetrance'], traitType='Mendelian')
+                                famInfoList[order].append(ins.famInfo)
+                                nucInfoList[order].append(ins.nucInfo)
+                                CIProbMapList[order].append(ins.CIProbMap)
+                                if args.verbose >= 0:
+                                    pbar.update(famIdx)
+                            if args.verbose >= 0:
+                                pbar.finish()
+                        # save geno prob info to file
+                        pickle.dump((famInfoList[order], nucInfoList[order], CIProbMapList[order]), open('{}.fnc'.format(name), 'w'))
+                # make gene1-gene2 dir if does not exist
+                dirName = os.path.join(tempFolder, "{}_{}".format(geneName1, geneName2))
+                try:
+                    os.mkdir(dirName)
+                except:
+                    pass
+                os.chdir(dirName)
+                # Begin simulation for each replicate (with locus heterogeneity)
+                if args.verbose >= 0:
+                    logging.info("Simulation in progress for gene pair {}_{}".format(geneName1, geneName2))
+                ## FIXME! temporarily disbale parallel func for simulating genotypes
+                if False:
+                    pass
+                else:   # if --debug
+                    if args.verbose >= 0:
+                        pbar = progressbar.ProgressBar(widgets=['', ' ', progressbar.Percentage(), ' ', progressbar.Bar('.'), ' ', progressbar.ETA(), ' '], maxval=args.num_reps).start()
+                    for rep in xrange(1, args.num_reps+1):
+                        fileName = 'rep{}.ped'.format(rep)
+                        fi = open(fileName, 'w')
+                        # determine missing sites, probability of missing/error calls for both genes 1 & 2
+                        _missingSites, _causality = {1:[], 2:[]}, {1:[], 2:[]}
+                        _missingSites[1], _probMissingCalls, _probErrorCalls, _causality[1] = determineMissingness(configInfo, sfsInfo, geneName1)
+                        _missingSites[2], _probMissingCalls, _probErrorCalls, _causality[2] = determineMissingness(configInfo, sfsInfo, geneName2)
+                        # generate genotypes for each family in the sample on both causal and marker genes
+                        for famIdx, familyID in enumerate(pedInfo.keys()):
+                            # determine causal & marker gene
+                            if random.random() < configInfo['locus_hetero'][0]:  # gene1 is causal
+                                causalGeneName, markerGeneName = geneName1, geneName2
+                                causalGeneIdx, markerGeneIdx = geneIdx1, geneIdx2
+                                causalGeneOrder, markerGeneOrder = 1, 2
+                            else:  # gene2 is causal
+                                causalGeneName, markerGeneName = geneName2, geneName1
+                                causalGeneIdx, markerGeneIdx = geneIdx2, geneIdx1
+                                causalGeneOrder, markerGeneOrder = 2, 1
+                            # sample genotype origins for all individuals contained in the 'famIdx'th family for the causal gene
+                            indGenoOrigins = SimPed_backward.restoreGenotypeOrigin(nucInfoList[causalGeneOrder][famIdx], CIProbMapList[causalGeneOrder][famIdx])
+                            # resotre actual genotypes for the causal gene
+                            causalGenoDict = SimPed_backward.generateGenotype(nucInfoList[causalGeneOrder][famIdx], indGenoOrigins, sfsInfo[causalGeneName], causalVarSites[causalGeneIdx], causalVarMafs[causalGeneIdx], configInfo['moi'], args.rec_rate, configInfo['compound_hetero'])
+                            # restore actual genotypes for the marker gene
+                            markerGenoIns = SimPed_forward(familyID, sfsInfo[markerGeneName], famInfoList[markerGeneOrder][famIdx], _missingSites[markerGeneOrder], _probMissingCalls, _probErrorCalls, _causality[markerGeneOrder], args.rec_rate)
+                            markerGeno = markerGenoIns.generate(genoOnly=True)
+                            # write simulated replicate to file
+                            SimPed_backward.writeToFile(familyID, famInfoList[causalGeneOrder][famIdx], causalGenoDict, fi, _missingSites[causalGeneOrder], _probMissingCalls, _probErrorCalls, _causality[causalGeneOrder], hapCoding='1-2', markerGeno=markerGeno, markerGeneOrder=markerGeneOrder, configInfo=configInfo, ifFillMissingPheno=args.fill_missing_pheno, causalSitesIdx=causalVarSites[geneIdx])
+                        if args.verbose >= 0:
+                            pbar.update(rep)
+                        fi.close()
+                        # also output simulated data in vcf format if needed
+                        if args.vcf:
+                            vcfFileName = 'rep{}.vcf'.format(rep)
+                            chrInfo = sfsInfo[geneName1]['chr'] + sfsInfo[geneName2]['chr']
+                            posInfo = sfsInfo[geneName1]['position'] + sfsInfo[geneName2]['position']
+                            refInfo = sfsInfo[geneName1]['ref'] + sfsInfo[geneName2]['ref']
+                            altInfo = sfsInfo[geneName1]['alt'] + sfsInfo[geneName2]['alt']
+                            varMafs = sfsInfo[geneName1]['maf'] + sfsInfo[geneName2]['maf']
+                            writeVCF(vcfFileName, pedFileName=fileName, chrInfo=chrInfo, posInfo=posInfo, refInfo=refInfo, altInfo=altInfo, varMafs=varMafs)
+                    if args.verbose >= 0:
+                        pbar.finish()
+                # upon completion of 'gene' compress simulated data
+                if args.tempdir is None:
+                    packaging(args, geneName1+'_'+geneName2, tempFolder)
+        ## wrong mode
+        else:
+            raise ValueError("Not a valid option for specified 'mode' in {} file, use single or pairwise (with locus heterogeneity)".format(os.path.basename(configInfo['mode'])))
+    
+    ## For Complex trait simulation
+    elif args.trait_type.lower() in ['c', 'complex']:
+        # massage options and values of configInfo
+        massageConfigInfo(configInfo)
+        if args.verbose >= 0:
+            logging.info("Begin Complex trait simulation for pedigrees")
+        # check configuration eligibility for backward manner (pheno-to-geno) simulation
+        if checkIfPhenoToGeno(configInfo):
+            if args.verbose >= 0:
+                logging.info("For fixed effect {} model with rare variants being causal, genotypes can be generated conditional on provided phenotypes".format(configInfo['model']))
+                if configInfo['max_vars'] >= 4:
+                    logging.warning('Allowing maximum number of causal rare variant sites per individual more than 4 is both unrealistic and computationally intractable, as most of variant sites are in low allele frequencies!')
+            # if moi in ['D', 'R', 'DAR', 'RAR"] (DAR - dominant across region, RAR - recessive across region):
+            # call func MendelianTraitSimulation_singleMode()
+            if configInfo['moi'] in ['D', 'R', 'DAR', 'RAR']:
+                MendelianTraitSimulation_singleMode(args, configInfo, sfsInfo, pedInfo, geneNames)
+                return
+            # else if moi in ['AAR', 'MAR', 'MAV'] (AAR - additive across region, MAR - multiplicative across region, MAV - multiplicative across variant sites): run the following
+            # for backward manner (fixed effect, maxNumVar per gene/haplotype <= 4, LOGIT or LNR model, causal vars being rare only)
+            # Retrieve info about causal var sites and number of max vars, causal var mafs for each gene (raise error is on any gene # of causal var sites < 1)
+            if args.verbose >= 0:
+                logging.info("Retrieving causal variant sites information from {}".format(os.path.basename(args.sfs_file)))
+            causalVarSites, maxVars = [], []
+            for geneName in geneNames:
+                tmp = selectCausalVarSite(sfsInfo[geneName]['maf'], sfsInfo[geneName]['annotation'], configInfo['def_rare'], configInfo['rare_only'], configInfo['proportion_causal'], geneName=geneName, minNum=configInfo['max_vars'], defNeutral=configInfo['def_neutral'], defProtective=configInfo['def_protective'])
+                causalVarSites.append(tmp[0])
+                maxVars.append(tmp[1])
+            # create individual-based probability affection status for LOGIT model given all possible genotypes
+            indProbAffDicts = {}
+            for n in list(set(maxVars)):
+                indProbAffDicts[n] = calIndProbAffDict(oddsRatio=configInfo['OR_rare_detrimental'], baselineEffect=configInfo['baseline_effect'], moi=configInfo['moi'], max_vars=n) if configInfo['model'] == 'LOGIT' else None
+            #
+            causalVarMafs = [[sfsInfo[geneName]['maf'][idx] for idx in site] for geneName, site in zip(geneNames, causalVarSites)]
+            # Calculate haplotype frequency (number of variant counts on haplotype level)
+            hapVarFreqs = [calHapNumVarFreq(maf, max_var) for (maf, max_var) in zip(causalVarMafs, maxVars)]
+            # create individual-based probability of observed phenotypes given all possible genotypes
+            # FIXME! Here it can paralle
+            for geneIdx, geneName in enumerate(geneNames):
+                # create temp folder to save intermediate ped files
+                if args.tempdir is not None:
+                    tempFolder = args.tempdir
+                else:
+                    tempFolder = tempfile.mkdtemp()
+                os.chdir(tempFolder)
+                ## restore genotype origions of all families contained in the ped file conditional on gene info of 'geneName'
+                # obtain pedigree-wise genotype frequency probability map (famInfoList, nucInfoList and CIProbMapList)
+                if args.verbose >= 0:
+                    logging.info("Begin analyzing pedigree-wise genotype frequencies for gene {}".format(geneName))
+                if not args.debug: # use parallel
+                    r = Parallel(n_jobs=args.num_jobs, verbose=5 if args.verbose == 1 else 0, backend="multiprocessing")(delayed(parallel.parallel_restoreGenotypeOrigins_Complex)(familyID, familyDict, configInfo, args, hapVarFreqs[geneIdx], indProbAffDicts[maxVars[geneIdx]]) for (familyID, familyDict) in zip(pedInfo.keys(), pedInfo.values()))
+                    famInfoList, nucInfoList, CIProbMapList = zip(*r)
+                else: # use single thread in debugging mode
+                    famInfoList, nucInfoList, CIProbMapList = [], [], []
+                    if args.verbose >= 0:
+                        pbar = progressbar.ProgressBar(widgets=['', ' ', progressbar.Percentage(), ' ', progressbar.Bar('.'), ' ', progressbar.ETA(), ' '], maxval=len(pedInfo.keys())).start()
+                    # calculate probability map of genotypic configurations of each family (use hap freq info, odds ratio for case-control trait and mean-shift for quantitative trait)
+                    for famIdx, (familyID, familyDict) in enumerate(zip(pedInfo.keys(), pedInfo.values())):
+                        # if case-control trait = complex qualitative
+                        if configInfo['model'] == 'LOGIT':
+                            ins = SimPed_backward(familyID, familyDict, args.num_reps, args.scalar, hapVarFreqs[geneIdx], indProbAffDict=indProbAffDicts[maxVars[geneIdx]], traitType='Qualitative')
+                        # if quantitative trait
+                        elif configInfo['model'] == 'LNR':
+                            # probability of each individual's genotype need to be calculated on-the-fly based on individual's quantitative phenotype
+                            ins = SimPed_backward(familyID, familyDict, args.num_reps, args.scalar, hapVarFreqs[geneIdx], traitType='Quantitative', meanshift=configInfo['meanshift_rare_detrimental'])
+                        else:
+                            raise ValueError("Can only choose model between 'LOGIT' and 'LNR'")
+                        # for each family add famInfo, nucInfo and CIProbMap info to family dicts 
+                        famInfoList.append(ins.famInfo)
+                        nucInfoList.append(ins.nucInfo)
+                        CIProbMapList.append(ins.CIProbMap)
+                        if args.verbose >= 0:
+                            pbar.update(famIdx)
+                    if args.verbose >= 0:
+                        pbar.finish()
+                # make gene name dir if it does not exist
+                dirName = os.path.join(tempFolder, geneName)
+                try:
+                    os.mkdir(dirName)
+                except:
+                    pass
+                os.chdir(dirName)
+                # Begin simulation for each replicate
+                if args.verbose >= 0:
+                    logging.info("Simulation in progress for gene {}".format(geneName))
+                ## FIXME! temporarily disable parallel computing for generating genotypes because parallelization seems to be even slower than single core
+                if False: # use parallel if not --debug
+                    pass
+                else: # if --debug
+                    if args.verbose >= 0:
+                        pbar = progressbar.ProgressBar(widgets=['', ' ', progressbar.Percentage(), ' ', progressbar.Bar('.'), ' ', progressbar.ETA(), ' '], maxval=args.num_reps).start()
+                    for rep in xrange(1, args.num_reps+1):
+                        fileName = 'rep{}.ped'.format(rep)
+                        fi = open(fileName, 'w')
+                        if args.lineage:
+                            lineageFileName = 'rep{}.lineage'.format(rep)
+                            fi_lineage = open(lineageFileName, 'w')
+                        # determine missing sites, probability of missing/error calls
+                        _missingSites, _probMissingCalls, _probErrorCalls, _causality = determineMissingness(configInfo, sfsInfo, geneName)
+                        # for each family generate genotypes
+                        for famIdx, familyID in enumerate(pedInfo.keys()):
+                            # sample genotype origins for all individuals contained in the 'famIdx'th family
+                            indGenoOrigins = SimPed_backward.restoreGenotypeOrigin_complexTrait(nucInfoList[famIdx], CIProbMapList[famIdx])
+                            # restore actual genotypes and lineage of haps
+                            genoDict, lineageDict = SimPed_backward.generateGenotype_complexTrait(nucInfoList[famIdx], indGenoOrigins, sfsInfo[geneName], causalVarSites[geneIdx], causalVarMafs[geneIdx], args.rec_rate)
+                            # write simulated replicate to file
+                            SimPed_backward.writeToFile(familyID, famInfoList[famIdx], genoDict, fi, _missingSites, _probMissingCalls, _probErrorCalls, _causality, hapCoding='1-2', configInfo=configInfo, ifFillMissingPheno=args.fill_missing_pheno, causalSitesIdx=causalVarSites[geneIdx])
+                            # write lineage info
+                            if args.lineage:
+                                SimPed_backward._writeToLineageFile(familyID, famInfoList[famIdx], lineageDict, fi_lineage)
+                                
+                        if args.verbose >= 0:
+                            pbar.update(rep)
+                        fi.close()
+                        if args.lineage:
+                            fi_lineage.close()
+                        # also output simulated data in vcf format if needed
+                        if args.vcf:
+                            vcfFileName = 'rep{}.vcf'.format(rep)
+                            writeVCF(vcfFileName, pedFileName=fileName, chrInfo=sfsInfo[geneName]['chr'], posInfo=sfsInfo[geneName]['position'], refInfo=sfsInfo[geneName]['ref'], altInfo=sfsInfo[geneName]['alt'], varMafs=sfsInfo[geneName]['maf'])
+                    if args.verbose >= 0:
+                        pbar.finish()
+                # upon completion of 'gene' move and (optional) compress simulated data
+                if args.tempdir is None:
+                    packaging(args, geneName, tempFolder) 
+        # geno-to-pheno manner simulation    
+        else: # forward manner to simulate genotypes first then generate phenotypes 
+            # will need to use spower
+            if args.verbose >= 0:
+                logging.info("Given the specified phenotype model from {}, genotypes will be simulated according to Mendelian segregation, phenotypes will be generated based on simulated genotypes and successful simulated datasets will be subject to ascertainment".format(args.config_file))
+            for geneIdx, geneName in enumerate(geneNames):
+                # create tmp folder to save intermediate ped files
+                if args.tempdir is not None:
+                    tempFolder = args.tempdir
+                else:
+                    tempFolder = tempfile.mkdtemp()
+                os.chdir(tempFolder)
+                if geneIdx == 0: # restore ped structures of all available families
+                    if args.verbose >= 0:
+                        logging.info('Begin restoring pedigree structures')
+                        famInfoList = Parallel(n_jobs=args.num_jobs, verbose = 5 if args.verbose == 1 else 0, backend="multiprocessing")(delayed(parallel.parallel_restoreStruct)(familyID, familyDict) for (familyID, familyDict) in zip(pedInfo.keys(), pedInfo.values()))
+                    if args.verbose >= 0:
+                        sys.stdout.write("Finish restoring pedigree structures.\n")
+                # make gene name dir if it does not exist
+                dirName = os.path.join(tempFolder, geneName)
+                try:
+                    os.mkdir(dirName)
+                except:
+                    pass
+                os.chdir(dirName)
+                if args.verbose >= 0:
+                    logging.info("Simulation in progress for gene {}".format(geneName))
+                #if args.debug: ## if --debug
+                if True: # FIXME: change to if args.debug after implementing parallel run
+                    if args.verbose >= 0:
+                        pbar = progressbar.ProgressBar(widgets=['', ' ', progressbar.Percentage(), ' ', progressbar.Bar('.'), ' ', progressbar.ETA(), ' '], maxval=args.num_reps).start()
+                    for rep in xrange(1, args.num_reps+1):  
+                        fileName = 'rep{}.ped'.format(rep)
+                        fi = open(fileName, 'w')
+                        for familyID, famInfo in zip(pedInfo.keys(), famInfoList):
+                                                        #_missingSites, _probMissingCalls, _probErrorCalls, _causality = determineMissingness(configInfo, sfsInfo, geneName)
+                            # init spower data object               
+                            spowerData = initPowerdataObj(configInfo, sfsInfo, geneName)
+                            # determine missing sites, probability of missing/error calls
+                            missingSites, probMissingCalls, probErrorCalls = genotyping_artifact(spowerData)
+                            causality = spowerData.data['direction']
+                            #FIXME!: carry out ascertainment! 
+                            ins = SimPed_forward(familyID, sfsInfo[geneName], famInfo, missingSites, probMissingCalls, probErrorCalls, causality, args.rec_rate)
+                            simRes = ins.generate(spowerData, hapCoding='1-2', genoOnly=False, ascertain_func=ascertainFunc, model=configInfo['model'],ascertainment_qualitative=configInfo['ascertainment_qualitative'], ascertainment_quantitative=configInfo['ascertainment_quantitative'])
+                            
+                            SaveFiles.simulatedData(fi, simRes)
+                        if args.verbose >= 0:
+                            pbar.update(rep)
+                        fi.close()
+                        # also output simulated data in vcf format if needed
+                        if args.vcf:
+                            vcfFileName = 'rep{}.vcf'.format(rep)
+                            writeVCF(vcfFileName, pedFileName=fileName, chrInfo=sfsInfo[geneName]['chr'], posInfo=sfsInfo[geneName]['position'], refInfo=sfsInfo[geneName]['ref'], altInfo=sfsInfo[geneName]['alt'], varMafs=sfsInfo[geneName]['maf'])
+                    if args.verbose >= 0:
+                        pbar.finish()
+            
+                else: # use parallel
+                    pass
+                # upon completion of 'gene' move and (optional) compress simulated data
+                if args.tempdir is None:
+                    packaging(args, geneName, tempFolder) 
+    else:
+        raise ValueError("Choose --trait_type between Mendelian and Complex\n")
+    return        
+  
+  
+def MendelianTraitSimulation_singleMode(args, configInfo, sfsInfo, pedInfo, geneNames):
+    '''
+    Main function for simulating Mendelian trait data for each single region/gene
+    '''
+    # convert configInfo if needed
+    if configInfo['trait_type'].lower() in ['c', 'complex']:
+        configInfo_new = {'trait_type':'m'}
+        configInfo_new['def_rare'] = configInfo['def_rare']
+        configInfo_new['rare_only'] = configInfo['rare_only']
+        configInfo_new['moi'] = 'D' if configInfo['moi'].startswith('D') else 'R'
+        configInfo_new['compound_hetero'] = True if configInfo['moi'].endswith('AR') else False
+        configInfo_new['proportion_causal'] = configInfo['proportion_causal']
+        configInfo_new['missing_low_maf'] = configInfo['missing_low_maf']
+        configInfo_new['missing_sites'] = configInfo['missing_sites']
+        configInfo_new['missing_calls'] = configInfo['missing_calls']
+        configInfo_new['error_calls'] = configInfo['error_calls']
+        # convert Odds ratio to penetrance
+        def _PrFromOR(r, k):
+            return (k*r)/(1-k+k*r)
+        pr = _PrFromOR(configInfo['OR_rare_detrimental'], configInfo['baseline_effect'])
+        configInfo_new['penetrance'] = (configInfo['baseline_effect'], configInfo['baseline_effect'] if configInfo_new['moi'] == 'R' else pr, pr)
+        configInfo = configInfo_new
+        del configInfo_new
+    # Retrieve info about causal var sites, causal var mafs for each gene (raise Error if on any gene remaining number of causal var sites < 1; for Mendelian trait at least 1 causal var site)
+    if args.verbose >= 0:
+        logging.info("Retrieving causal variant sites information from {}".format(os.path.basename(args.sfs_file)))
+    causalVarSites = [selectCausalVarSite(sfsInfo[geneName]['maf'], sfsInfo[geneName]['annotation'], configInfo['def_rare'], configInfo['rare_only'], configInfo['proportion_causal'], geneName=geneName, minNum=1)[0] for geneName in geneNames]
+    causalVarMafs = [[sfsInfo[geneName]['maf'][idx] for idx in site] for geneName, site in zip(geneNames, causalVarSites)]
+    # Calculate haplotype frequency (number of variant counts on haplotype level)
+    if args.verbose >= 0:
+        logging.info("Calculating gene-level causal haplotype frequency")
+    hapVarFreqs = [calHapNumVarFreq(maf, max_vars=1) for maf in causalVarMafs]
+    # create individual-based probability of affection status given all possible genotypes
+    for geneIdx, geneName in enumerate(geneNames):
+        # create temp folder to save intermediate ped files
+        if args.tempdir is not None:
+            tempFolder = args.tempdir
+        else:
+            tempFolder = tempfile.mkdtemp()
+        os.chdir(tempFolder)
+        # Restore genotype origins of all families contained in the ped file conditional on gene info of 'geneName'
+        # obtain pedigree-wise genotype frequency probability map (famInfoList, nucInfoList and CIProbMapList)
+        if args.verbose >= 0:
+            logging.info("Begin analyzing pedigree-wise genotype frequencies for gene {}".format(geneName))
+        if not args.debug: # use parallel if not --debug
+            r = Parallel(n_jobs=args.num_jobs, verbose=5 if args.verbose == 1 else 0, backend="multiprocessing")(delayed(parallel.parallel_restoreGenotypeOrigins_Mendelian)(familyID, familyDict, args.num_reps, args.scalar, hapVarFreqs[geneIdx], configInfo['penetrance']) for (familyID, familyDict) in zip(pedInfo.keys(), pedInfo.values()))
+            famInfoList, nucInfoList, CIProbMapList = zip(*r)
+        else:  # use single thread if --debug
+            famInfoList, nucInfoList, CIProbMapList = [], [], []
+            if args.verbose >= 0:
+                pbar = progressbar.ProgressBar(widgets=['', ' ', progressbar.Percentage(), ' ', progressbar.Bar('.'), ' ', progressbar.ETA(), ' '], maxval=len(pedInfo.keys())).start()
+            for famIdx, (familyID, familyDict) in enumerate(zip(pedInfo.keys(), pedInfo.values())):
+                ins = SimPed_backward(familyID, familyDict, args.num_reps, args.scalar, hapVarFreqs[geneIdx], configInfo['penetrance'], traitType='Mendelian')
+                famInfoList.append(ins.famInfo)
+                nucInfoList.append(ins.nucInfo)
+                CIProbMapList.append(ins.CIProbMap)
+                if args.verbose >= 0:
+                    pbar.update(famIdx)
+            if args.verbose >= 0:
+                pbar.finish()
+        # make gene name dir if does not exist
+        dirName = os.path.join(tempFolder, geneName)
+        try:
+            os.mkdir(dirName)
+        except:
+            pass
+        os.chdir(dirName)
+        # Begin simulation for each replicate
+        if args.verbose >= 0:
+            logging.info("Simulation in progress for gene {}".format(geneName))
+        ## FIXME! temporarily disable parallel computing for generating genotypes because parallelization seems to be even slower than single core
+        if False:  # use parallel if not --debug
+            Parallel(n_jobs=args.num_jobs, verbose=5 if args.verbose == 1 else 0, backend="multiprocessing")(delayed(parallel.parallel_generateGenotype_Mendelian_single)(rep, geneIdx, geneName, pedInfo, famInfoList, nucInfoList, CIProbMapList, sfsInfo, causalVarSites, causalVarMafs, configInfo, args.rec_rate, hapCoding='1-2') for rep in xrange(1, args.num_reps+1))
+        else:  # if --debug
+            if args.verbose >= 0:
+                pbar = progressbar.ProgressBar(widgets=['', ' ', progressbar.Percentage(), ' ', progressbar.Bar('.'), ' ', progressbar.ETA(), ' '], maxval=args.num_reps).start()
+            for rep in xrange(1, args.num_reps+1):
+                fileName = 'rep{}.ped'.format(rep)
+                fi = open(fileName, 'w')
+                # determine missing sites and probability of missing calls and probability of error calls
+                _missingSites, _probMissingCalls, _probErrorCalls, _causality = determineMissingness(configInfo, sfsInfo, geneName)
+                # for each family generate genotypes
+                for famIdx, familyID in enumerate(pedInfo.keys()):
+                    # sample genotype origins for all individuals contained in the 'famIdx'th family
+                    indGenoOrigins = SimPed_backward.restoreGenotypeOrigin(nucInfoList[famIdx], CIProbMapList[famIdx])
+                    # restore actual genotypes
+                    genoDict = SimPed_backward.generateGenotype(nucInfoList[famIdx], indGenoOrigins, sfsInfo[geneName], causalVarSites[geneIdx], causalVarMafs[geneIdx], configInfo['moi'], args.rec_rate, configInfo['compound_hetero'])
+                    # write simulated replicate to file
+                    SimPed_backward.writeToFile(familyID, famInfoList[famIdx], genoDict, fi, _missingSites, _probMissingCalls, _probErrorCalls, _causality, hapCoding='1-2', configInfo=configInfo, ifFillMissingPheno=args.fill_missing_pheno, causalSitesIdx=causalVarSites[geneIdx])
+                if args.verbose >= 0:
+                    pbar.update(rep)
+                fi.close()
+                # also output simulated data in vcf format if needed
+                if args.vcf:
+                    vcfFileName = 'rep{}.vcf'.format(rep)
+                    writeVCF(vcfFileName, pedFileName=fileName, chrInfo=sfsInfo[geneName]['chr'], posInfo=sfsInfo[geneName]['position'], refInfo=sfsInfo[geneName]['ref'], altInfo=sfsInfo[geneName]['alt'], varMafs=sfsInfo[geneName]['maf'])
+            if args.verbose >= 0:
+                pbar.finish()
+        # upon completion of 'gene' compress simulated data if no tempdir is specified, otherwise do nothing
+        if args.tempdir is None:
+            packaging(args, geneName, tempFolder)
+        
+        
+        
+def checkIfPhenoToGeno(configInfo):
+    '''
+    check if phenotype model can allow genotypes
+    to be simulated conditional on given phenotypes
+    '''
+    # if all following assertion criteria are met, use pheno-to-geno manner simulation, otherwise, use geno-to-pheno simulation
+    try:
+        assert configInfo['model'] in ['LOGIT', 'LNR']
+        assert configInfo['rare_only']
+        if configInfo['model'] == 'LOGIT': # check if fixed effect for LOGIT model
+            assert configInfo['OR_rare_protective'] in [None, 1]
+            assert configInfo['ORmax_rare_detrimental'] == None
+            assert configInfo['ORmin_rare_protective'] == None
+            assert configInfo['OR_common_detrimental'] in [None, 1]
+            assert configInfo['OR_common_protective'] in [None, 1]
+        if configInfo['model'] == 'LNR':  # check if fixed effect for LNR model
+            assert configInfo['meanshift_rare_protective'] in [None, 0]
+            assert configInfo['meanshiftmax_rare_detrimental'] == None
+            assert configInfo['meanshiftmax_rare_protective'] == None
+            assert configInfo['meanshift_common_detrimental'] in [None, 0]
+            assert configInfo['meanshift_common_protective'] in [None, 0]
+        return True
+    except:
+        return False
+
+
+def determineMissingness(configInfo, sfsInfo, geneName):
+    '''
+    Determine missingSites, probMissingCalls, probErrorCalls and causal variant sites
+    '''
+    if configInfo['missing_low_maf'] == None:
+        configInfo['missing_low_maf'] = 0
+    if configInfo['missing_sites'] == None:
+        configInfo['missing_sites'] = 0
+    if configInfo['missing_calls'] == None:
+        configInfo['missing_calls'] = 0
+    if configInfo['error_calls'] == None:
+        configInfo['error_calls'] = 0
+    lowMafSitesIdx = [idx for idx, maf in enumerate(sfsInfo[geneName]['maf']) if maf < configInfo['missing_low_maf']]
+    tmpMissingSitesIdx = [idx for idx in range(len(sfsInfo[geneName]['maf'])) if random.random() < configInfo['missing_sites']]
+    missingSites = list(set.union(*[set(lowMafSitesIdx), set(tmpMissingSitesIdx)]))
+    probMissingCalls = [configInfo['missing_calls']] * 3
+    probErrorCalls = [configInfo['error_calls']] * 3
+    # The following 'causality' does not mean that all variants are causal but only indicates that probability of error calls is the same across all variant sites
+    causality = ['d'] * len(sfsInfo[geneName]['maf'])
+    return missingSites, probMissingCalls, probErrorCalls, causality
+
+
+def massageConfigInfo(configInfo):
+    '''
+    reconfig configInfo dict to be spower compatible
+    '''
+    #
+    configInfo['discard_variants'] = False
+    configInfo['discard_samples'] = False
+    configInfo['proportion_detrimental'] = None
+    configInfo['proportion_protective'] = None
+    configInfo['p1'] = None
+    configInfo['methods'] = 'default'
+    configInfo['sample_size'] = 100
+    configInfo['missing_sites_detrimental'] = None
+    configInfo['missing_sites_protective'] = None
+    configInfo['missing_sites_neutral'] = None
+    configInfo['missing_calls_detrimental'] = None
+    configInfo['missing_calls_protective'] = None
+    configInfo['missing_calls_neutral'] = None
+    configInfo['error_calls_detrimental'] = None
+    configInfo['error_calls_protective'] = None
+    configInfo['error_calls_neutral'] = None
+    # set proportion_detrimental and proportion_protective equal to proportion_causal
+    if configInfo['proportion_causal'] != None:
+        configInfo['proportion_detrimental'] = configInfo['proportion_causal']
+        configInfo['proportion_protective'] = configInfo['proportion_causal']
+    # LNR model options
+    if configInfo['meanshift_rare_detrimental'] is None:
+        configInfo['meanshift_rare_detrimental'] = 0
+    if configInfo['meanshift_rare_protective'] is None:
+        configInfo['meanshift_rare_protective'] = 0
+    if configInfo['meanshift_common_detrimental'] is None:
+        configInfo['meanshift_common_detrimental'] = 0
+    if configInfo['meanshift_common_protective'] is None:
+        configInfo['meanshift_common_protective'] = 0
+    # LOGIT model options
+    if configInfo['OR_rare_detrimental'] is None:
+        configInfo['OR_rare_detrimental'] = 1
+    if configInfo['OR_rare_protective'] is None:
+        configInfo['OR_rare_protective'] = 1
+    if configInfo['OR_common_detrimental'] is None:
+        configInfo['OR_common_detrimental'] = 1
+    if configInfo['OR_common_protective'] is None:
+        configInfo['OR_common_protective'] = 1
+    return
+
+
+def packaging(args, geneName, tempFolder):
+    '''
+    Move simulated data to specified dir and (optional) compress data 
+    '''
+    if args.compress != None:
+        if args.verbose >= 0:
+            logging.info('Compressing and saving simulated data for gene {} to {}'.format(geneName, os.path.join(args.output_folder, geneName)))
+        os.chdir(args.output_folder)
+        compressSave(geneName, tempFolder, args.compress, args.num_jobs, args.verbose)
+    else:
+        if args.verbose >= 0:
+            logging.info('Saving simulated data for gene {} to {}'.format(geneName, os.path.join(args.output_folder, geneName)))
+        # remove existing ~/geneName folder
+        toDir = os.path.join(args.output_folder, geneName)
+        if os.path.isdir(toDir):
+            shutil.rmtree(toDir)
+        # move simulated data to specified dir
+        shutil.move(os.path.join(tempFolder, geneName), toDir)
+    return
+
+
+def ascertainFunc(famInfo, model='LOGIT', asc_qualitative=(0), asc_quantitative=((0, None))):
+    '''
+    An operator to apply on famInfo obj to determine
+    if simulated family sample can be 'ascertained'
+    - model: choose from LOGIT, PAR and LNR
+    - 
+    '''
+    phenoDict = {}
+    for ind in famInfo:
+        gen = famInfo[ind]['gen']
+        trait = float(famInfo[ind]['trait'])
+        if gen not in phenoDict:
+            phenoDict[gen] = [trait]
+        else:
+            phenoDict[gen].append(trait)
+    # sort trait values by generations from bottom gen
+    phenos = [phenoDict[gen] for gen in sorted(phenoDict.keys(), reverse=True)]
+    # If qualitative trait
+    if model in ['LOGIT', 'PAR']:
+        numGens = min(len(phenos), len(asc_qualitative))
+        for phe, asc in zip(phenos[:numGens], asc_qualitative[:numGens]):
+            if phe.count(2) < int(asc):
+                return False
+        return True
+    # if quantitative trait:
+    if model == 'LNR':
+        tmp = asc_quantitative.split(',')
+        tmp = [i.split('(')[-1].split(')')[0].strip() for i in tmp]
+        numGens = min(len(phenos), len(asc_quantitative)/2)
+        for idx in range(numGens):
+            phe, asc = phenos[idx], tmp[2*idx:2*idx+2]
+            numInd, cri = int(asc[0]), asc[1]
+            if cri in ('~', 'None'):
+                continue
+            elif cri.endswith("~"):
+                thres = float(cri.split('~')[0])
+                if [p >= thres for p in phe].count(True) < numInd:
+                    return False
+            elif cri.startswith("~"):
+                thres = float(cri.split('~')[-1])
+                if [p <= thres for p in phe].count(True) < numInd:
+                    return False
+            else:
+                a,b = [float(i) for i in cri.split('~')]
+                if [a <= p <= b for p in phe].count(True) < numInd:
+                    return False
+        return True    
+    
+
+if __name__ == '__main__':
+    master_parser = argparse.ArgumentParser(
+        description = '''Program to simulate pedigree-based gene/region-level genotype and phenotype data for complex and Mendelian trait rare variant studies given any pedigree structures''',
+        prog = 'rarepedsim',
+        epilog = '''Biao Li (biaol@bcm.edu) (c) 2014-2015. License: GNU General Public License (http://www.gnu.org/licenses/)'''
+    )
+    master_parser.add_argument('--version,', action='version', version='%(prog)s 1.0-rc1')
+    subparsers = master_parser.add_subparsers()
+    # subparser 1 - srv
+    parser_srv = subparsers.add_parser('srv', help='''create site frequency spectrum (sfs) from simulated rare variant sequence data''')
+    srvArguments(parser_srv)
+    #parser_srv = srvOptionalArgs(parser_srv).get()
+    parser_srv.set_defaults(func=srv_func)
+    # subparser 2 - generate
+    parser_generate = subparsers.add_parser('generate', help='''generate genotype and phenotype for specified pedigree structure(s)''')
+    generateArguments(parser_generate)
+    parser_generate.set_defaults(func=generate_func)
+    # getting arguments
+    args = master_parser.parse_args()
+    #print vars(args)
+    # calling the associated functions
+    if args.debug:
+        args.func(args)
+    else:
+        try:
+            args.func(args)
+        except Exception as e:
+            print e
+            sys.exit('An ERROR has occured: {}'.format(e))
+                            

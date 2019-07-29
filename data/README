@@ -1,0 +1,14 @@
+This data folder contains the following files:
+
+1) Templates of input configuration files for phenotypic model parameters
+   MendelianPhenotype.conf & ComplexPhenotype.conf
+   
+2) Provided input files to run examples (see Documentation "Quick Guild and Examples" for more details):
+   57Inds.ped, 562NucFams.ped, 2000Trios.ped & 4Gen.ped (for input --ped_file)
+   Gazave2013European.sfs (for input --sfs_file)
+   MendelianTrait_eg1.conf, MendelianTrait_eg2.conf, ComplexTrait_eg3_qualitative.conf & ComplexTrait_eg4_quantitative.conf (for input --config_file)
+   
+3) Template of input configuration file for "rarepedsim srv" command:
+   SimulateRareVariant.conf
+   
+Please refer to RarePedSim online documentation for more detils. 
